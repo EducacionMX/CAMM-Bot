@@ -22,7 +22,7 @@ AVISO_PRIVACIDAD = (
     "ℹ️ Esta conversación puede ser utilizada con fines de mejora "
     "del servicio e investigación institucional, conforme a nuestra "
     "política de privacidad:\n"
-    "http://www.cam-mty.org/\n\n"
+    "https://sites.google.com/view/cam-mty/aviso-de-privacidad\n\n"
 )
 CATEGORIAS = [
     "Cursos de actualización",
