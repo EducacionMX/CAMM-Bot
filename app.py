@@ -1,5 +1,6 @@
 import os
 import json
+import threading
 import anthropic
 import requests
 from flask import Flask, request, jsonify, render_template_string
@@ -440,40 +441,56 @@ def handle_message():
                     if sender_id in paused_conversations:
                         continue
 
-                    history, nombre = get_history_from_sheets(sender_id)
-
-                    if nombre:
-                        recent_conversations[sender_id] = nombre
-
-                    is_new_user = is_first_time_user(sender_id, history)
-
-                    reply, tokens = get_claude_response(sender_id, text, history)
-
-                    if es_trivial(text):
-                        categoria, subcategoria = "Sin relevancia institucional", "No aplica"
-                    else:
-                        categoria, subcategoria = clasificar_mensaje(text, history)
-
-                    derivacion = detectar_derivacion(reply)
-
-                    # Primero responde la pregunta del usuario
-                    send_message(sender_id, reply)
-
-                    # Después, solo si es usuario nuevo, envía el aviso breve
-                    if is_new_user:
-                        send_message(sender_id, AVISO_PRIVACIDAD)
-
-                    log_conversation(
-                        sender_id,
-                        text,
-                        reply,
-                        tokens,
-                        categoria,
-                        subcategoria,
-                        derivacion
-                    )
+                    threading.Thread(
+                        target=procesar_mensaje,
+                        args=(sender_id, text),
+                        daemon=True
+                    ).start()
 
     return jsonify({"status": "ok"}), 200
+
+
+def procesar_mensaje(sender_id, text):
+    # El hilo responde rápido a Facebook y evita duplicados por reintentos del webhook.
+    try:
+        history, nombre = get_history_from_sheets(sender_id)
+
+        if nombre:
+            recent_conversations[sender_id] = nombre
+
+        is_new_user = is_first_time_user(sender_id, history)
+
+        reply, tokens = get_claude_response(sender_id, text, history)
+
+        if es_trivial(text):
+            categoria, subcategoria = "Sin relevancia institucional", "No aplica"
+        else:
+            categoria, subcategoria = clasificar_mensaje(text, history)
+
+        derivacion = detectar_derivacion(reply)
+
+        if sender_id in paused_conversations:
+            print(f"[pausa_arroba] Respuesta cancelada: {sender_id}")
+            return
+
+        # Primero responde la pregunta del usuario
+        send_message(sender_id, reply)
+
+        # Después, solo si es usuario nuevo, envía el aviso breve
+        if is_new_user:
+            send_message(sender_id, AVISO_PRIVACIDAD)
+
+        log_conversation(
+            sender_id,
+            text,
+            reply,
+            tokens,
+            categoria,
+            subcategoria,
+            derivacion
+        )
+    except Exception as e:
+        print(f"[procesar_mensaje] ERROR: {e} | sender_id: {sender_id}")
 
 
 def get_claude_response(sender_id, user_message, history):
@@ -484,7 +501,7 @@ def get_claude_response(sender_id, user_message, history):
 
         message = client.messages.create(
             model=CLAUDE_MODEL,
-            max_tokens=300,
+            max_tokens=500,
             # Sin pensamiento: respuesta directa y sin gastar tokens extra.
             thinking={"type": "disabled"},
             system=[{
@@ -493,7 +510,6 @@ def get_claude_response(sender_id, user_message, history):
                 "cache_control": {"type": "ephemeral"}
             }],
             messages=history_reciente,
-            extra_headers={"anthropic-beta": "prompt-caching-2024-07-31"}
         )
 
         reply = texto_de_respuesta(message)
