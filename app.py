@@ -23,6 +23,15 @@ client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 # CLAUDE_MODEL en el hosting (por ejemplo: claude-haiku-4-5).
 CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-haiku-5-5")
 
+
+def texto_de_respuesta(message):
+    """Devuelve solo el texto de la respuesta de Claude.
+
+    Haiku 5.5 puede incluir bloques de "pensamiento" (ThinkingBlock) antes
+    del texto, que no tienen el atributo .text. Por eso ya no se lee
+    content[0].text: se juntan únicamente los bloques de tipo "text"."""
+    return "".join(b.text for b in message.content if getattr(b, "type", None) == "text")
+
 processed_messages = set()
 paused_conversations = {}   # {sender_id: nombre}
 recent_conversations = {}   # {sender_id: nombre}
@@ -217,10 +226,13 @@ Responde SOLO el JSON, sin explicación ni bloques de código. Ejemplo:
         result = client.messages.create(
             model=CLAUDE_MODEL,
             max_tokens=100,
+            # Sin pensamiento: Haiku 5.5 lo trae activado por defecto y
+            # gastaría los 100 tokens antes de escribir el JSON.
+            thinking={"type": "disabled"},
             messages=[{"role": "user", "content": prompt}]
         )
 
-        raw = result.content[0].text
+        raw = texto_de_respuesta(result)
         print(f"[clasificar] RAW: {raw!r} | mensaje: {user_message}")
 
         raw = limpiar_json(raw)
@@ -473,6 +485,8 @@ def get_claude_response(sender_id, user_message, history):
         message = client.messages.create(
             model=CLAUDE_MODEL,
             max_tokens=300,
+            # Sin pensamiento: respuesta directa y sin gastar tokens extra.
+            thinking={"type": "disabled"},
             system=[{
                 "type": "text",
                 "text": SYSTEM_PROMPT,
@@ -482,7 +496,7 @@ def get_claude_response(sender_id, user_message, history):
             extra_headers={"anthropic-beta": "prompt-caching-2024-07-31"}
         )
 
-        reply = message.content[0].text
+        reply = texto_de_respuesta(message)
         tokens = message.usage.input_tokens + message.usage.output_tokens
 
         return reply, tokens
