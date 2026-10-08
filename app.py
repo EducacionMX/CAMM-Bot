@@ -1,7 +1,7 @@
 import os
 import json
 import threading
-from collections import deque
+import time
 import anthropic
 import requests
 from flask import Flask, request, jsonify, render_template_string
@@ -448,25 +448,37 @@ def handle_message():
     return jsonify({"status": "ok"}), 200
 
 
-# ── Cola por usuario ───────────────────────────────────────────────────────
-# Cada usuario tiene su propia fila: si escribe varios mensajes seguidos, se
-# atienden de uno en uno y en el orden en que llegaron, de modo que cada
-# respuesta ya ve el historial (y las respuestas) de los mensajes anteriores.
-# Usuarios distintos se siguen atendiendo en paralelo. La fila de un usuario
-# se elimina sola cuando queda vacía.
-colas_por_usuario = {}   # {sender_id: deque([texto, ...])}
+# ── Cola por usuario con agrupación de mensajes ────────────────────────────
+# Cada usuario tiene su propia fila. Si escribe varios mensajes seguidos, se
+# espera a que deje de escribir (AGRUPAR_SEGUNDOS sin mensajes nuevos), se
+# juntan todos en un solo texto (uno por línea) y Claude responde UNA sola
+# vez viendo todo. Para que nadie espere indefinidamente, la espera nunca pasa
+# de AGRUPAR_MAXIMO_SEGUNDOS desde el primer mensaje del grupo. Los mensajes
+# que lleguen mientras se procesa un grupo forman el siguiente grupo, en
+# orden. Usuarios distintos se siguen atendiendo en paralelo. La fila de un
+# usuario se elimina sola cuando queda vacía.
+try:
+    AGRUPAR_SEGUNDOS = float(os.environ.get("AGRUPAR_SEGUNDOS", "3"))
+except ValueError:
+    AGRUPAR_SEGUNDOS = 3.0
+AGRUPAR_MAXIMO_SEGUNDOS = 10.0
+colas_por_usuario = {}   # {sender_id: {"textos": [...], "primero": t, "ultimo": t}}
 colas_lock = threading.Lock()
 
 
 def encolar_mensaje(sender_id, text):
     """Agrega el mensaje a la fila del usuario; si no había fila activa, inicia
     un hilo que la atiende."""
+    ahora = time.time()
     with colas_lock:
         cola = colas_por_usuario.get(sender_id)
         if cola is not None:
-            cola.append(text)
+            if not cola["textos"]:
+                cola["primero"] = ahora
+            cola["textos"].append(text)
+            cola["ultimo"] = ahora
             return
-        colas_por_usuario[sender_id] = deque([text])
+        colas_por_usuario[sender_id] = {"textos": [text], "primero": ahora, "ultimo": ahora}
     try:
         threading.Thread(target=atender_cola, args=(sender_id,), daemon=True).start()
     except Exception as e:
@@ -476,16 +488,25 @@ def encolar_mensaje(sender_id, text):
 
 
 def atender_cola(sender_id):
-    """Atiende en orden los mensajes de un usuario hasta vaciar su fila."""
+    """Espera a que el usuario deje de escribir, junta sus mensajes y los
+    procesa como uno solo; repite hasta vaciar su fila."""
     while True:
+        textos = None
         with colas_lock:
             cola = colas_por_usuario.get(sender_id)
-            if not cola:
+            if cola is None or not cola["textos"]:
                 colas_por_usuario.pop(sender_id, None)
                 return
-            text = cola.popleft()
+            espera = min(cola["ultimo"] + AGRUPAR_SEGUNDOS,
+                         cola["primero"] + AGRUPAR_MAXIMO_SEGUNDOS) - time.time()
+            if espera <= 0:
+                textos = cola["textos"]
+                cola["textos"] = []
+        if textos is None:
+            time.sleep(espera)
+            continue
         try:
-            procesar_mensaje(sender_id, text)
+            procesar_mensaje(sender_id, "\n".join(textos))
         except Exception as e:
             print(f"[cola] ERROR: {e} | sender_id: {sender_id}")
 
