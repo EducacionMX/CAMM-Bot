@@ -1,5 +1,7 @@
 import os
 import json
+import threading
+import time
 import anthropic
 import requests
 from flask import Flask, request, jsonify, render_template_string
@@ -22,6 +24,7 @@ client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 # una versión anterior sin tocar el código, define la variable de entorno
 # CLAUDE_MODEL en el hosting (por ejemplo: claude-haiku-4-5).
 CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-haiku-5-5")
+MENSAJE_RESPALDO = "Gracias por tu mensaje. En breve un asesor del CAMM te contactará."
 
 
 def texto_de_respuesta(message):
@@ -440,40 +443,115 @@ def handle_message():
                     if sender_id in paused_conversations:
                         continue
 
-                    history, nombre = get_history_from_sheets(sender_id)
-
-                    if nombre:
-                        recent_conversations[sender_id] = nombre
-
-                    is_new_user = is_first_time_user(sender_id, history)
-
-                    reply, tokens = get_claude_response(sender_id, text, history)
-
-                    if es_trivial(text):
-                        categoria, subcategoria = "Sin relevancia institucional", "No aplica"
-                    else:
-                        categoria, subcategoria = clasificar_mensaje(text, history)
-
-                    derivacion = detectar_derivacion(reply)
-
-                    # Primero responde la pregunta del usuario
-                    send_message(sender_id, reply)
-
-                    # Después, solo si es usuario nuevo, envía el aviso breve
-                    if is_new_user:
-                        send_message(sender_id, AVISO_PRIVACIDAD)
-
-                    log_conversation(
-                        sender_id,
-                        text,
-                        reply,
-                        tokens,
-                        categoria,
-                        subcategoria,
-                        derivacion
-                    )
+                    encolar_mensaje(sender_id, text)
 
     return jsonify({"status": "ok"}), 200
+
+
+# ── Cola por usuario con agrupación de mensajes ────────────────────────────
+# Cada usuario tiene su propia fila. Si escribe varios mensajes seguidos, se
+# espera a que deje de escribir (AGRUPAR_SEGUNDOS sin mensajes nuevos), se
+# juntan todos en un solo texto (uno por línea) y Claude responde UNA sola
+# vez viendo todo. Para que nadie espere indefinidamente, la espera nunca pasa
+# de AGRUPAR_MAXIMO_SEGUNDOS desde el primer mensaje del grupo. Los mensajes
+# que lleguen mientras se procesa un grupo forman el siguiente grupo, en
+# orden. Usuarios distintos se siguen atendiendo en paralelo. La fila de un
+# usuario se elimina sola cuando queda vacía.
+try:
+    AGRUPAR_SEGUNDOS = float(os.environ.get("AGRUPAR_SEGUNDOS", "3"))
+except ValueError:
+    AGRUPAR_SEGUNDOS = 3.0
+AGRUPAR_MAXIMO_SEGUNDOS = 10.0
+colas_por_usuario = {}   # {sender_id: {"textos": [...], "primero": t, "ultimo": t}}
+colas_lock = threading.Lock()
+
+
+def encolar_mensaje(sender_id, text):
+    """Agrega el mensaje a la fila del usuario; si no había fila activa, inicia
+    un hilo que la atiende."""
+    ahora = time.time()
+    with colas_lock:
+        cola = colas_por_usuario.get(sender_id)
+        if cola is not None:
+            if not cola["textos"]:
+                cola["primero"] = ahora
+            cola["textos"].append(text)
+            cola["ultimo"] = ahora
+            return
+        colas_por_usuario[sender_id] = {"textos": [text], "primero": ahora, "ultimo": ahora}
+    try:
+        threading.Thread(target=atender_cola, args=(sender_id,), daemon=True).start()
+    except Exception as e:
+        with colas_lock:
+            colas_por_usuario.pop(sender_id, None)
+        print(f"[cola] ERROR al iniciar hilo: {e} | sender_id: {sender_id}")
+
+
+def atender_cola(sender_id):
+    """Espera a que el usuario deje de escribir, junta sus mensajes y los
+    procesa como uno solo; repite hasta vaciar su fila."""
+    while True:
+        textos = None
+        with colas_lock:
+            cola = colas_por_usuario.get(sender_id)
+            if cola is None or not cola["textos"]:
+                colas_por_usuario.pop(sender_id, None)
+                return
+            espera = min(cola["ultimo"] + AGRUPAR_SEGUNDOS,
+                         cola["primero"] + AGRUPAR_MAXIMO_SEGUNDOS) - time.time()
+            if espera <= 0:
+                textos = cola["textos"]
+                cola["textos"] = []
+        if textos is None:
+            time.sleep(espera)
+            continue
+        try:
+            procesar_mensaje(sender_id, "\n".join(textos))
+        except Exception as e:
+            print(f"[cola] ERROR: {e} | sender_id: {sender_id}")
+
+
+def procesar_mensaje(sender_id, text):
+    # El hilo responde rápido a Facebook y evita duplicados por reintentos del webhook.
+    try:
+        history, nombre = get_history_from_sheets(sender_id)
+
+        if nombre:
+            recent_conversations[sender_id] = nombre
+
+        is_new_user = is_first_time_user(sender_id, history)
+
+        reply, tokens = get_claude_response(sender_id, text, history)
+
+        if es_trivial(text):
+            categoria, subcategoria = "Sin relevancia institucional", "No aplica"
+        else:
+            categoria, subcategoria = clasificar_mensaje(text, history)
+
+        derivacion = detectar_derivacion(reply)
+
+        if sender_id in paused_conversations:
+            print(f"[pausa_arroba] Respuesta cancelada: {sender_id}")
+            return
+
+        # Primero responde la pregunta del usuario
+        send_message(sender_id, reply)
+
+        # Después, solo si es usuario nuevo, envía el aviso breve
+        if is_new_user:
+            send_message(sender_id, AVISO_PRIVACIDAD)
+
+        log_conversation(
+            sender_id,
+            text,
+            reply,
+            tokens,
+            categoria,
+            subcategoria,
+            derivacion
+        )
+    except Exception as e:
+        print(f"[procesar_mensaje] ERROR: {e} | sender_id: {sender_id}")
 
 
 def get_claude_response(sender_id, user_message, history):
@@ -484,7 +562,7 @@ def get_claude_response(sender_id, user_message, history):
 
         message = client.messages.create(
             model=CLAUDE_MODEL,
-            max_tokens=300,
+            max_tokens=500,
             # Sin pensamiento: respuesta directa y sin gastar tokens extra.
             thinking={"type": "disabled"},
             system=[{
@@ -493,21 +571,26 @@ def get_claude_response(sender_id, user_message, history):
                 "cache_control": {"type": "ephemeral"}
             }],
             messages=history_reciente,
-            extra_headers={"anthropic-beta": "prompt-caching-2024-07-31"}
         )
 
         reply = texto_de_respuesta(message)
         tokens = message.usage.input_tokens + message.usage.output_tokens
 
+        if message.stop_reason == "max_tokens":
+            print(f"[claude] AVISO: respuesta cortada por max_tokens | sender_id: {sender_id}")
+        if message.stop_reason == "refusal" or not reply.strip():
+            print(f"[claude] Sin texto utilizable | stop_reason={message.stop_reason} | sender_id: {sender_id}")
+            return MENSAJE_RESPALDO, tokens
+
         return reply, tokens
 
     except Exception as e:
         print(f"[claude] ERROR: {e}")
-        return "Gracias por tu mensaje. En breve un asesor del CAMM te contactará.", 0
+        return MENSAJE_RESPALDO, 0
 
 
 def send_message(recipient_id, message_text):
-    url = "https://graph.facebook.com/v19.0/me/messages"
+    url = "https://graph.facebook.com/v26.0/me/messages"
     headers = {"Content-Type": "application/json"}
     params = {"access_token": PAGE_ACCESS_TOKEN}
 
