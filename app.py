@@ -1,6 +1,7 @@
 import os
 import json
 import threading
+from collections import deque
 import anthropic
 import requests
 from flask import Flask, request, jsonify, render_template_string
@@ -23,6 +24,7 @@ client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 # una versión anterior sin tocar el código, define la variable de entorno
 # CLAUDE_MODEL en el hosting (por ejemplo: claude-haiku-4-5).
 CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-haiku-5-5")
+MENSAJE_RESPALDO = "Gracias por tu mensaje. En breve un asesor del CAMM te contactará."
 
 
 def texto_de_respuesta(message):
@@ -441,13 +443,51 @@ def handle_message():
                     if sender_id in paused_conversations:
                         continue
 
-                    threading.Thread(
-                        target=procesar_mensaje,
-                        args=(sender_id, text),
-                        daemon=True
-                    ).start()
+                    encolar_mensaje(sender_id, text)
 
     return jsonify({"status": "ok"}), 200
+
+
+# ── Cola por usuario ───────────────────────────────────────────────────────
+# Cada usuario tiene su propia fila: si escribe varios mensajes seguidos, se
+# atienden de uno en uno y en el orden en que llegaron, de modo que cada
+# respuesta ya ve el historial (y las respuestas) de los mensajes anteriores.
+# Usuarios distintos se siguen atendiendo en paralelo. La fila de un usuario
+# se elimina sola cuando queda vacía.
+colas_por_usuario = {}   # {sender_id: deque([texto, ...])}
+colas_lock = threading.Lock()
+
+
+def encolar_mensaje(sender_id, text):
+    """Agrega el mensaje a la fila del usuario; si no había fila activa, inicia
+    un hilo que la atiende."""
+    with colas_lock:
+        cola = colas_por_usuario.get(sender_id)
+        if cola is not None:
+            cola.append(text)
+            return
+        colas_por_usuario[sender_id] = deque([text])
+    try:
+        threading.Thread(target=atender_cola, args=(sender_id,), daemon=True).start()
+    except Exception as e:
+        with colas_lock:
+            colas_por_usuario.pop(sender_id, None)
+        print(f"[cola] ERROR al iniciar hilo: {e} | sender_id: {sender_id}")
+
+
+def atender_cola(sender_id):
+    """Atiende en orden los mensajes de un usuario hasta vaciar su fila."""
+    while True:
+        with colas_lock:
+            cola = colas_por_usuario.get(sender_id)
+            if not cola:
+                colas_por_usuario.pop(sender_id, None)
+                return
+            text = cola.popleft()
+        try:
+            procesar_mensaje(sender_id, text)
+        except Exception as e:
+            print(f"[cola] ERROR: {e} | sender_id: {sender_id}")
 
 
 def procesar_mensaje(sender_id, text):
@@ -515,15 +555,21 @@ def get_claude_response(sender_id, user_message, history):
         reply = texto_de_respuesta(message)
         tokens = message.usage.input_tokens + message.usage.output_tokens
 
+        if message.stop_reason == "max_tokens":
+            print(f"[claude] AVISO: respuesta cortada por max_tokens | sender_id: {sender_id}")
+        if message.stop_reason == "refusal" or not reply.strip():
+            print(f"[claude] Sin texto utilizable | stop_reason={message.stop_reason} | sender_id: {sender_id}")
+            return MENSAJE_RESPALDO, tokens
+
         return reply, tokens
 
     except Exception as e:
         print(f"[claude] ERROR: {e}")
-        return "Gracias por tu mensaje. En breve un asesor del CAMM te contactará.", 0
+        return MENSAJE_RESPALDO, 0
 
 
 def send_message(recipient_id, message_text):
-    url = "https://graph.facebook.com/v19.0/me/messages"
+    url = "https://graph.facebook.com/v26.0/me/messages"
     headers = {"Content-Type": "application/json"}
     params = {"access_token": PAGE_ACCESS_TOKEN}
 
