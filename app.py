@@ -273,6 +273,32 @@ def detectar_derivacion(bot_response):
     return "No"
 
 
+# ── Copia del historial en memoria ─────────────────────────────────────────
+# Respaldo para cuando Google Sheets no responde (timeout o error): el bot usa
+# los últimos mensajes que él mismo atendió en este proceso, en lugar de
+# contestar sin contexto. Sheets sigue siendo la fuente principal: la copia
+# solo se usa si Sheets falla. Se guardan como máximo HISTORY_LIMIT mensajes
+# por usuario y HISTORIAL_CACHE_USUARIOS usuarios (se descartan los menos recientes).
+HISTORIAL_CACHE_USUARIOS = 500
+historial_cache = {}   # {sender_id: [{"role": ..., "content": ...}, ...]}
+historial_lock = threading.Lock()
+
+
+def guardar_en_cache(sender_id, mensajes):
+    """Guarda en memoria los últimos HISTORY_LIMIT mensajes del usuario."""
+    with historial_lock:
+        historial_cache.pop(sender_id, None)
+        historial_cache[sender_id] = list(mensajes[-HISTORY_LIMIT:])
+        while len(historial_cache) > HISTORIAL_CACHE_USUARIOS:
+            historial_cache.pop(next(iter(historial_cache)))
+
+
+def historial_de_cache(sender_id):
+    """Devuelve una copia de la lista guardada para el usuario ([] si no hay)."""
+    with historial_lock:
+        return list(historial_cache.get(sender_id, []))
+
+
 def get_history_from_sheets(sender_id):
     """Recupera historial y nombre del usuario desde Google Sheets."""
     try:
@@ -281,6 +307,7 @@ def get_history_from_sheets(sender_id):
             params={"action": "get_history", "sender_id": sender_id},
             timeout=5
         )
+        response.raise_for_status()
         data = response.json()
 
         nombre = data.get("nombre", "")
@@ -293,7 +320,11 @@ def get_history_from_sheets(sender_id):
 
         return data.get("messages", []), nombre
 
-    except Exception:
+    except Exception as e:
+        respaldo = historial_de_cache(sender_id)
+        if respaldo:
+            print(f"[historial] Sheets no respondió ({type(e).__name__}); uso la copia en memoria de {len(respaldo)} mensajes | sender_id: {sender_id}")
+            return respaldo, ""
         return [], ""
 
 
@@ -515,6 +546,7 @@ def procesar_mensaje(sender_id, text):
     # El hilo responde rápido a Facebook y evita duplicados por reintentos del webhook.
     try:
         history, nombre = get_history_from_sheets(sender_id)
+        previo = list(history)
 
         if nombre:
             recent_conversations[sender_id] = nombre
@@ -535,12 +567,14 @@ def procesar_mensaje(sender_id, text):
             return
 
         # Primero responde la pregunta del usuario
-        send_message(sender_id, reply)
+        entregado = send_message(sender_id, reply)
 
         # Después, solo si es usuario nuevo, envía el aviso breve
         if is_new_user:
             send_message(sender_id, AVISO_PRIVACIDAD)
 
+        if entregado:
+            guardar_en_cache(sender_id, previo + [{"role": "user", "content": text}, {"role": "assistant", "content": reply}])
         log_conversation(
             sender_id,
             text,
@@ -599,7 +633,15 @@ def send_message(recipient_id, message_text):
         "message": {"text": message_text}
     }
 
-    requests.post(url, headers=headers, params=params, json=data)
+    try:
+        r = requests.post(url, headers=headers, params=params, json=data, timeout=10)
+        if not r.ok:
+            print(f"[facebook] ERROR {r.status_code} al enviar | recipient: {recipient_id} | respuesta: {r.text[:300]}")
+            return False
+        return True
+    except Exception as e:
+        print(f"[facebook] ERROR al enviar ({type(e).__name__}) | recipient: {recipient_id}")
+        return False
 
 
 def log_conversation(
