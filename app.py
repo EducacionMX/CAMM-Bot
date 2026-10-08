@@ -18,6 +18,11 @@ HISTORY_LIMIT = 10
 
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
+# Modelo de Claude que usa el bot (clasificador y respuestas). Para volver a
+# una versión anterior sin tocar el código, define la variable de entorno
+# CLAUDE_MODEL en el hosting (por ejemplo: claude-haiku-4-5).
+CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-haiku-5-5")
+
 processed_messages = set()
 paused_conversations = {}   # {sender_id: nombre}
 recent_conversations = {}   # {sender_id: nombre}
@@ -210,7 +215,7 @@ Responde SOLO el JSON, sin explicación ni bloques de código. Ejemplo:
 {{"categoria":"Cursos de actualización","subcategoria":"Costos"}}"""
 
         result = client.messages.create(
-            model="claude-haiku-4-5",
+            model=CLAUDE_MODEL,
             max_tokens=100,
             messages=[{"role": "user", "content": prompt}]
         )
@@ -466,7 +471,7 @@ def get_claude_response(sender_id, user_message, history):
         history_reciente = history[-HISTORY_LIMIT:] if len(history) > HISTORY_LIMIT else history
 
         message = client.messages.create(
-            model="claude-haiku-4-5",
+            model=CLAUDE_MODEL,
             max_tokens=300,
             system=[{
                 "type": "text",
